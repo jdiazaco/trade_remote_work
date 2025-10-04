@@ -19,7 +19,7 @@ source('2) code/0_set_parameter_values.R')
 wrds <- dbConnect(RPostgres::Postgres(), host = "wrds-pgdata.wharton.upenn.edu",port = 9737,
                   dbname = "wrds", user = "am0195", password = "BodyBody123!", sslmode = "require")
 wrds_query= function(query_string){dbGetQuery(wrds, query_string) %>% data.table()}
-
+getSymbols("^VIX", src = "yahoo", from = "2008-01-01", auto.assign = FALSE) -> VIX_xts
 # import IBES data --------------------------------------------------------
 importing_IBES = T
 if (importing_IBES){
@@ -44,15 +44,26 @@ if (importing_IBES){
     .[!is.na(val_2), `:=`(forecast_lb = val_1, forecast_ub = val_2, forecast_range = val_2 - val_1)] %>% 
     .[forecast_range < 0, paste0('forecast', c('', '_lb', '_ub', '_range')):= NA] %>% 
     .[forecast_range == 0 ,  paste0('forecast', c('_lb', '_ub', '_range')):= NA] %>% 
-    .[,c('val_1', 'val_2') := NULL] %>%
+    .[,c('val_1', 'val_2') := NULL]  %>% 
     
     ## remove forecasts that appear after the fact and those that are over a year away 
     .[, end_of_period := ymd(paste(prd_yr, prd_mon, 1, sep = "-")) %m+% months(1) - days(1)] %>% 
-    .[fcst_ann_date <= end_of_period & end_of_period - fcst_ann_date < 365] %>% .[,end_of_period := NULL] 
+    .[fcst_ann_date <= end_of_period & end_of_period - fcst_ann_date < 365] 
+  
+    ### CALCULATE THE VIX OVER FORECAST TIME HORIZON 
+    vix_IBES = IBES_forecast_data[, c('ibes_ticker', 'fcst_ann_date', 'end_of_period')]
+    vix_daily =  data.table(date = index(VIX_xts), vix  = as.numeric(Cl(VIX_xts)))
+    vix_IBES_mean = vix_daily[vix_IBES, on = .(date >= fcst_ann_date, date <= end_of_period),
+                              allow.cartesian = TRUE, nomatch = 0L] %>% 
+      rename(fcst_ann_date = date ,end_of_period  = date.1) %>% 
+      .[, .(fcst_period_mean_vix = NA_mean(vix)), by = .(ibes_ticker, fcst_ann_date, end_of_period)]
+    IBES_forecast_data = merge(IBES_forecast_data,vix_IBES_mean, all.x = T, 
+                               by = c('ibes_ticker', 'fcst_ann_date', 'end_of_period')) %>% 
+      .[,end_of_period:= NULL] %>% 
   
   ## mark the first / last forecast 
-  setorder(IBES_forecast_data, ibes_ticker, measure, prd_yr, fcst_ann_date)
-  IBES_forecast_data[, `:=`(first_forecast = .I == .I[1], last_forecast = .I == .I[.N]), by = c('ibes_ticker', 'measure', 'prd_yr')]
+  setorder(ibes_ticker, measure, prd_yr, fcst_ann_date) %>% 
+  .[, `:=`(first_forecast = .I == .I[1], last_forecast = .I == .I[.N]), by = c('ibes_ticker', 'measure', 'prd_yr')]
   
   ###### ACTUAL VALUES OF THE FORECASTED VARIABLES 
   #https://wrds-www.wharton.upenn.edu/pages/get-data/lseg-ibes/ibes-academic/detail-history/actuals/  
@@ -68,7 +79,8 @@ if (importing_IBES){
     .[, fiscal_year := ifelse(prd_mon >5, prd_yr, prd_yr - 1)] %>%
     .[!is.na(ibes_ticker)] %>% 
     .[, pstart := pends %m-% years(1) + days(1)] %>% 
-    select(ibes_ticker, fiscal_year,pstart, pends, measure, curr, units, con_fil(., 'forecast'), realized_value,usfirm, french_ibes, euro_usd) %>% 
+    select(ibes_ticker, fcst_ann_date,fiscal_year,pstart, pends, measure, curr, units, con_fil(., 'forecast'),
+           realized_value, usfirm, french_ibes, euro_usd, fcst_period_mean_vix) %>% 
     
     ## handle weird duplicates due to firms changing their reporting timing 
     merge(distinct(., fiscal_year, ibes_ticker, .keep_all = T) %>% .[, c('fiscal_year', 'ibes_ticker', 'pends')], by = c('fiscal_year', 'ibes_ticker', 'pends'))
@@ -83,11 +95,27 @@ if (importing_IBES){
   .[, `:=`(abs_firm_log_forecast_error = abs(asinh(realized_value) - abs(asinh(forecast))),
            abs_analyst_log_forecast_error = abs(asinh(realized_value) - abs(asinh(analyst_forecast_mean))),
            abs_analyst_forecast_error = abs(realized_value - analyst_forecast_mean),
-           abs_firm_forecast_error = abs(realized_value - forecast))] 
+           abs_firm_forecast_error = abs(realized_value - forecast))] %>% 
+    
+  ### Generate a var for initial analyst expectations 
+  setorder(.,ibes_ticker, fiscal_year) %>% 
+  .[, log_fy_init_analyst_forecast := asinh(analyst_forecast_mean[1]), by = .(ibes_ticker, fiscal_year)]
   
+  ### GENERATE VARIANCE DATA 
+  ibes_var_dta= IBES_initial_combined[,log_realized_value := asinh(realized_value)] %>% 
+    .[first_forecast == T & !is.na(ibes_ticker)] %>% 
+    unbalanced_lag(., 'ibes_ticker', 'fiscal_year', c('log_realized_value', 'abs_firm_log_forecast_error'), c(1:4)) %>%
+    .[, abs_firm_log_forecast_error_prior3 := apply(.SD,1, NA_mean), .SDcols = paste0('abs_firm_log_forecast_error_lag',c(1:3))] %>% 
+    .[, ibes_5y_log_rev_var := apply(.SD, 1, NA_var), .SDcols = paste0('log_realized_value',c("", paste0("_lag", 1:4)))]  %>% 
+    select(ibes_ticker, fiscal_year, con_fil(.,'log_rev_var','prior3'))
+  
+  IBES_initial_combined = merge(IBES_initial_combined,ibes_var_dta, all.x = T, by = c('fiscal_year', 'ibes_ticker'))
  
   write_parquet(IBES_initial_combined, "1) data/11_parameter_calibration/raw/2_IBES_forecast_plus_actuals_plus_birth_raw.parquet")
 }
+
+
+
 # Import compustat data --------------------------------------------------------
 importing_compustat = F
 if (importing_compustat){
@@ -118,7 +146,7 @@ compustat_dta =  import_file('1) data/11_parameter_calibration/raw/4_compustat_d
   gvkey = GVKEY) %>% 
   .[,naics := {d <- str_replace_all(as.character(naics), "[^0-9]", ""); d[nchar(d) == 0] <- NA_character_; str_pad(d, 6, pad = "0")}] %>% 
   .[, naics_2d := substr(naics,1,2)] %>% 
-  .[, fiscal_yr_enddate := ymd(paste(fiscal_year, fiscal_yr_end_month, 1, sep = "-")) %m+% months(1) - days(1)] %>% 
+  .[, fiscal_yr_enddate := ymd(paste(fiscal_year + ifelse(as.numeric(fiscal_yr_end_month) < 6, 1, 0), fiscal_yr_end_month, 1, sep = "-")) %m+% months(1) - days(1)] %>% 
   .[, fiscal_yr_startdate := fiscal_yr_enddate %m-% years(1) + days(1)] %>% 
   
   ### discard obs with missing or neg emp, rev, or capital
@@ -239,26 +267,35 @@ write_parquet(MA_data, '1) data/11_parameter_calibration/raw/9_LSEG_merger_dta.p
 }
 
 # combine and clean financial data -----------------------------------------------------------------
-combining_financials = T
+combining_financials = F
 if (combining_financials){
 IBES = import_file("1) data/11_parameter_calibration/raw/2_IBES_forecast_plus_actuals_plus_birth_raw.parquet")
 compustat = import_file('1) data/11_parameter_calibration/raw/5_compustat_data_initial_processed.parquet')
 ma_dta = import_file('1) data/11_parameter_calibration/raw/9_LSEG_merger_dta.parquet')
 
 ### MERGE AND CLEAN 
-financial_dta = merge(compustat,IBES, all = T,  by = c('ibes_ticker', 'fiscal_year')) %>% 
-  .[is.na(fiscal_yr_enddate),  fiscal_yr_enddate := pends] %>% 
-  .[is.na(fiscal_yr_startdate), fiscal_yr_startdate := pstart] %>% 
-  .[, c('pstart', 'pends') := NULL ] %>% 
-  .[finan_or_util == F | is.na(finan_or_util)] %>% 
-  .[,first_or_no_forecast := is.na(first_forecast) | first_forecast == T] %>% 
+  financial_dta = merge(compustat,IBES, all = T,  by = c('ibes_ticker', 'fiscal_year')) %>% 
+    .[is.na(fiscal_yr_enddate),  fiscal_yr_enddate := pends] %>% 
+    .[is.na(fiscal_yr_startdate), fiscal_yr_startdate := pstart] %>% 
+    .[, c('pstart', 'pends') := NULL ] %>% 
+    .[finan_or_util == F | is.na(finan_or_util)] %>% 
+    .[,first_or_no_forecast := is.na(first_forecast) | first_forecast == T] %>% 
+    
+    merge(ma_dta, all.x = T, by = c('fiscal_year', 'gvkey')) %>% 
+    .[is.na(fy_MA_deals), fy_MA_deals := 0] %>% 
+    .[fy_MA_deals ==0, fy_MA_deal_value := 0] %>% 
+    .[,log_fy_MA_deal_value := asinh(fy_MA_deal_value)] 
   
-  merge(ma_dta, all.x = T, by = c('fiscal_year', 'gvkey')) %>% 
-  .[is.na(fy_MA_deals), fy_MA_deals := 0] %>% 
-  .[fy_MA_deals ==0, fy_MA_deal_value := 0] %>% 
-  .[,log_fy_MA_deal_value := asinh(fy_MA_deal_value)] 
+    ### add Vix for the fiscal year 
+    vix_financial = distinct(financial_dta, fiscal_yr_startdate, fiscal_yr_enddate)
+    vix_daily =  data.table(date = index(VIX_xts), vix  = as.numeric(Cl(VIX_xts)))
+    vix_financial_mean = vix_daily[vix_financial, on = .(date >= fiscal_yr_startdate, date <= fiscal_yr_enddate),
+                            allow.cartesian = TRUE, nomatch = 0L] %>% 
+    rename(fiscal_yr_startdate = date , fiscal_yr_enddate  = date.1) %>% 
+    .[, .(fiscal_yr_mean_vix = NA_mean(vix)), by = .( fiscal_yr_startdate, fiscal_yr_enddate)]
+    financial_dta = merge(financial_dta,vix_financial_mean, all.x = T, by = c('fiscal_yr_startdate', 'fiscal_yr_enddate')) 
   
-  ### # IBES birth (and industry group) match + age vars 
+### # IBES birth (and industry group) match + age vars 
   ibes_birth_ages = wrds_query("SELECT item6003 AS firm_name, item6038 AS ibes_ticker, item6008 AS isin, item6011 AS industry_group, 
                             item18272 AS birth_date, item18273 AS incorporation_date FROM trws.wrds_ws_company WHERE item6038 is not NULL") %>% 
     distinct(ibes_ticker, .keep_all = T) %>% remove_if_NA('ibes_ticker')
@@ -267,145 +304,93 @@ financial_dta = merge(compustat,IBES, all = T,  by = c('ibes_ticker', 'fiscal_ye
     .[,birth_year := year(case_when(!is.na(birth_date) ~ birth_date,
                                     !is.na(incorporation_date) ~ incorporation_date,
                                     !is.na(ipodate) ~ ipodate))] %>% 
-    .[fiscal_year >= birth_year,age := fiscal_year - birth_year]  
-    
-  
-    ibes_var_dta= financial_dta[,log_realized_value := asinh(realized_value)] %>% 
-    .[first_forecast == T & !is.na(ibes_ticker)] %>% 
-    unbalanced_lag(., 'ibes_ticker', 'fiscal_year', c('log_realized_value', 'abs_firm_log_forecast_error'), c(1:4)) %>%
-    .[, abs_firm_log_forecast_error_prior3 := apply(.SD,1, NA_mean), .SDcols = paste0('abs_firm_log_forecast_error_lag',c(1:3))] %>% 
-    .[, ibes_5y_log_rev_var := apply(.SD, 1, NA_var), .SDcols = paste0('log_realized_value',c("", paste0("_lag", 1:4)))]  %>% 
-    .[, industry_ibes_5y_log_rev_var := NA_mean(ibes_5y_log_rev_var), by = .(industry_group, fiscal_year)] %>% 
-      select(ibes_ticker, fiscal_year, con_fil(.,'log_rev_var','prior3'))
-   
-    compustat_var_dta= financial_dta[,log_compustat_rev := asinh(compustat_rev)] %>% 
-      .[first_forecast == T & !is.na(gvkey)] %>% 
-      unbalanced_lag(., 'gvkey', 'fiscal_year', 'log_compustat_rev', c(1:4)) %>%
-      .[, compustat_5y_log_rev_var := apply(.SD, 1, NA_var), .SDcols = paste0('log_compustat_rev',c("", paste0("_lag", 1:4)))]  %>% 
-      .[, industry_compustat_5y_log_rev_var := NA_mean(compustat_5y_log_rev_var), by = .(industry_group, fiscal_year)] %>% 
-      select(gvkey, fiscal_year, con_fil(.,'log_rev_var'))
- 
-     financial_dta= financial_dta %>% 
-       merge(ibes_var_dta, all.x = T, by = c( 'ibes_ticker', 'fiscal_year')) %>%
-       merge(compustat_var_dta, all.x = T, by = c('gvkey', 'fiscal_year'))
-    
-    
-    
-  
-
+    .[fiscal_year >= birth_year,age := 1+ fiscal_year - birth_year]  %>% 
+    .[, log_age := log(age)]
     
 ### ADD THE RCID DATA 
-rcid_matching =  wrds_query("SELECT rcid,child_rcid, ultimate_parent_rcid, year_founded, isin, cusip,
-                            hq_country as revel_country, year_founded as revel_birth_year 
-                            FROM revelio.company_mapping WHERE isin is not NULL or cusip is not NULL")
-financial_dta = financial_dta %>% merge(rcid_matching[!is.na(cusip),c('cusip', 'rcid')] %>% distinct(cusip, .keep_all = T), by = 'cusip', all.x = T) %>% 
-  merge(rcid_matching[!is.na(isin),c('rcid', 'isin')] %>% distinct(isin, .keep_all = T) %>% rename(rcid_isin = rcid), by= 'isin', all.x = T) %>% 
-  .[is.na(rcid), rcid := rcid_isin] %>% .[,rcid_isin := NULL]  %>%
-  merge(rcid_matching[!is.na(rcid),c('rcid','child_rcid', 'ultimate_parent_rcid', 'revel_country', 'revel_birth_year')], all.x = T, by = 'rcid')
-
-  duplicated_rcids = distinct(financial_dta,permno, rcid) %>% drop_na() %>% .[,.(count = .N), by = rcid] %>% .[count >1] %>% pull(rcid) 
-  financial_dta = financial_dta[rcid %in% duplicated_rcids, rcid := NA] %>% .[, ultimate_parent :=  ultimate_parent_rcid == rcid] %>% 
-  .[,is_ultimate_parent := rcid == ultimate_parent_rcid & !is.na(rcid)]
+  rcid_matching =  wrds_query("SELECT rcid,child_rcid, ultimate_parent_rcid, year_founded, isin, cusip,
+                              hq_country as revel_country, year_founded as revel_birth_year 
+                              FROM revelio.company_mapping WHERE isin is not NULL or cusip is not NULL")
+  
+  financial_dta = financial_dta %>% merge(rcid_matching[!is.na(cusip),c('cusip', 'rcid')] %>% distinct(cusip, .keep_all = T), by = 'cusip', all.x = T) %>% 
+    merge(rcid_matching[!is.na(isin),c('rcid', 'isin')] %>% distinct(isin, .keep_all = T) %>% rename(rcid_isin = rcid), by= 'isin', all.x = T) %>% 
+    .[is.na(rcid), rcid := rcid_isin] %>% .[,rcid_isin := NULL] 
+  
+  rcid_flags = financial_dta[first_or_no_forecast == T & !is.na(rcid)] %>% 
+    .[, count := .N, by = .(rcid, fiscal_year)] %>%  .[count >1] %>% distinct(rcid, fiscal_year) %>% .[,rcid_flag := T] 
+  
+  financial_dta = merge(financial_dta, rcid_flags, all.x = T, by = c('rcid', 'fiscal_year')) %>% .[rcid_flag == T, rcid := NA] %>% 
+    merge(rcid_matching[!is.na(rcid),c('rcid','child_rcid', 'ultimate_parent_rcid', 'revel_country', 'revel_birth_year')], all.x = T, by = 'rcid') %>% 
+    .[,is_ultimate_parent := rcid == ultimate_parent_rcid & !is.na(rcid)] %>% 
+    .[fiscal_year >= revel_birth_year,revel_age := 1+ fiscal_year - as.numeric(revel_birth_year)] %>% 
+    .[,`:=`(log_revel_age = log(revel_age), revel_age_sq = revel_age^2)] 
+    
+### ADD DETRENDED VARIANCE DATA  
+  compustat_var_dta= financial_dta[,log_compustat_rev := asinh(compustat_rev)] %>% 
+    .[first_or_no_forecast == T & !is.na(gvkey) & !is.na(compustat_rev)] %>% 
+    .[,obs_count := .N, by = gvkey] %>% 
+    .[obs_count > 5, compustat_trend_resid := sub_regression(log_compustat_rev, log_revel_age, residuals = T), by = gvkey] %>% 
+    .[, abs_compustat_trend_resid := abs(compustat_trend_resid)] %>% 
+    unbalanced_lag(., 'gvkey', 'fiscal_year', 'compustat_trend_resid', 1:3) %>% 
+    .[, ("compustat_trend_resid_var_prior3") := apply(.SD, 1,NA_var), .SDcols = paste0("compustat_trend_resid", "_lag",1:3)] %>% 
+    .[, ("mean_abs_compustat_trend_resid_prior3") := apply(.SD, 1,function(x) NA_mean(abs(x))), .SDcols = paste0("compustat_trend_resid", "_lag",1:3)] %>% 
+    .[,c('gvkey','fiscal_year','compustat_trend_resid','abs_compustat_trend_resid', 
+         "compustat_trend_resid_var_prior3" ,"mean_abs_compustat_trend_resid_prior3")]
+    
+  ibes_var_dta= financial_dta[,log_realized_value := asinh(realized_value)] %>% 
+    .[first_or_no_forecast == T & !is.na(ibes_ticker) & !is.na(realized_value)] %>% 
+    .[,obs_count := .N, by = ibes_ticker] %>% 
+    .[obs_count > 5, ibes_trend_resid := sub_regression(log_realized_value, log_revel_age, residuals = T), by = ibes_ticker] %>% 
+    .[, abs_ibes_trend_resid := abs(ibes_trend_resid)] %>% 
+    unbalanced_lag(., 'ibes_ticker', 'fiscal_year', 'ibes_trend_resid', 1:3) %>% 
+    .[, ("ibes_trend_resid_var_prior3") := apply(.SD, 1,NA_var), .SDcols = paste0("ibes_trend_resid", "_lag",1:3)] %>% 
+    .[, ("mean_abs_ibes_trend_resid_prior3") := apply(.SD, 1,function(x) NA_mean(abs(x))), .SDcols = paste0("ibes_trend_resid", "_lag",1:3)] %>% 
+    .[,c('ibes_ticker','fiscal_year','ibes_trend_resid','abs_ibes_trend_resid',
+         "ibes_trend_resid_var_prior3" ,"mean_abs_ibes_trend_resid_prior3")]
+  
+  financial_dta= financial_dta %>% 
+    merge(ibes_var_dta, all.x = T, by = c( 'ibes_ticker', 'fiscal_year')) %>%
+    merge(compustat_var_dta, all.x = T, by = c('gvkey', 'fiscal_year'))
+  
 write_parquet(financial_dta, "1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
 }  
-
-
-# import role data of rcid only ------------------------------------------------
-importing_rcid_role = F
-if(importing_rcid_role){
-
-  financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
-  
-  ### GENERATE THE ROLE DATA 
-  rcid_list = setdiff(unique(financial_dta[['rcid']]), NA)
-  
-  for (c_rcid in rcid_list){
-    output_file = paste0('1) data/11_parameter_calibration/raw/temp/role_',c_rcid,'.csv')
-    if (!file.exists(output_file)){
-      fwrite(data.frame(h = 'h'), output_file)
-      print(round(100*which(rcid_list == c_rcid) / length(rcid_list),2))
-      parent_list = c_rcid
-      in_clause <- paste(sprintf("'%s'", gsub("'", "''", parent_list)), collapse = ",")
-      
-      temp = wrds_query(sprintf("
-      SELECT ip.rcid as rcid, ip.startdate, ip.enddate, ip.role_k1500, ip.total_compensation, ip.weight, 
-      iu.prestige, iu.highest_degree 
-      FROM revelio.individual_positions ip 
-      LEFT JOIN revelio.individual_user iu ON ip.user_id = iu.user_id
-      WHERE ip.total_compensation IS NOT NULL
-      AND ip.weight IS NOT NULL 
-      AND ip.startdate IS NOT NULL 
-      AND ip.rcid IN (%s)", in_clause)) %>%
-        .[, `:=`(college = highest_degree %in% c('Master', 'Bachelor', 'MBA', 'Doctor'),
-                 college_total = !is.na(highest_degree))] %>% 
-        .[!is.na(weight) & !is.na(total_compensation)] %>% 
-        .[, comp := total_compensation * weight] %>% 
-        merge(import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv'), by = 'role_k1500')
-      
-      output_table = rbindlist(lapply(2000:2024, function(yr){
-        sub_temp = lapply(c(0,1), function(lag){
-          sub_temp = financial_dta[rcid == c_rcid & fiscal_year == yr] %>% 
-            distinct(rcid, fiscal_year, .keep_all = T) %>% 
-            .[,c('rcid', 'fiscal_year', 'fiscal_yr_startdate', 'fiscal_yr_enddate')] %>%
-            .[, `:=`(fiscal_yr_startdate= fiscal_yr_startdate %m-% years(lag), fiscal_yr_enddate= fiscal_yr_enddate %m-% years(lag))] %>% 
-            merge(temp, by = 'rcid') %>% 
-            .[startdate <= fiscal_yr_enddate & (enddate >= fiscal_yr_startdate | is.na(enddate))]  %>% 
-            .[, .(comp_total = sum(comp), empl_total = sum(weight),
-                  comp_data = sum(comp*data), empl_data = sum(weight*data),
-                  comp_rnd = sum(comp*rnd), comp_stem = sum(comp*stem), comp_non_data_rnd = sum(comp*non_data_rnd),
-                  share_comp_data_analyst = sum(comp*data_analyst)/ sum(comp*data),
-                  avg_prestige = NA_mean(prestige),
-                  share_empl_college = NA_sum(weight*college)/ NA_sum(weight*college_total)), by = .(rcid, fiscal_year)] 
-          if (lag == 1) sub_temp = sub_temp %>% rename_with(.cols = setdiff(names(sub_temp), c('rcid','fiscal_year')), ~paste0(.,'_lag1'))
-          return(sub_temp)
-        })
-        sub_temp = merge(sub_temp[[1]], sub_temp[[2]], by = c('rcid', 'fiscal_year'), all = T)
-      })) 
-      fwrite(output_table, output_file)
-    }
-  }
-  file_list = list.files(path = '1) data/11_parameter_calibration/raw/temp', full.names = T)
-  rcid_role_dta = rbindlist(lapply(file_list,import_file), use.names = T, fill = T)
-  write_parquet(rcid_role_dta,'1) data/11_parameter_calibration/raw/10_firm_role_dta.parquet') 
-}
 
 
 # import role data of parent company --------------------------------------
 importing_parent_role = T
 if(importing_parent_role){
-  
   financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
-
   ### GENERATE THE ROLE DATA 
   rcid_list = setdiff(unique(financial_dta[is_ultimate_parent == T][['rcid']]), NA)
-  
+  role_dict= import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv')
+  for (stub in con_fil(role_dict, 'data', 'rnd', 'stem')){
+    assign(paste0('list_',stub),paste0( "'",paste(role_dict[get(stub) == T, role_k1500], collapse = "', '"), "'"))}
   for (c_rcid in rcid_list){
     output_file = paste0('1) data/11_parameter_calibration/raw/parent_temp/parent_role_',c_rcid,'.csv')
     if (!file.exists(output_file)){
       fwrite(data.frame(h = 'h'), output_file)
       print(round(100*which(rcid_list == c_rcid) / length(rcid_list),2))
-      parent_list = c_rcid
-      in_clause <- paste(sprintf("'%s'", gsub("'", "''", parent_list)), collapse = ",")
-      
-      temp =  wrds_query(sprintf("WITH target_rcids AS (
+  
+      temp =  wrds_query(paste0("WITH target_rcids AS (
       SELECT DISTINCT cm.rcid, cm.ultimate_parent_rcid
       FROM revelio.company_mapping cm
-      WHERE cm.ultimate_parent_rcid IN (%s)
-    )
+      WHERE cm.ultimate_parent_rcid = ", c_rcid, ")
     SELECT
-      t.ultimate_parent_rcid  AS parent_rcid, ip.rcid, ip.startdate, ip.enddate, ip.role_k1500,
-      ip.total_compensation, ip.weight, iu.prestige, iu.highest_degree 
+      t.ultimate_parent_rcid  AS rcid, ip.startdate, ip.enddate, 
+      ip.total_compensation*ip.weight AS comp, ip.weight, iu.prestige, 
+      iu.highest_degree IN ('Master', 'Bachelor', 'MBA', 'Doctor') AS college,
+      iu.highest_degree IS NOT NULL AS college_total,
+      ip.role_k1500 IS NOT NULL AS total,
+      ip.role_k1500 IN (",list_data,") AS data,
+      ip.role_k1500 IN (",list_non_std_data,") AS non_std_data,
+      ip.role_k1500 IN (",list_stem,") AS stem,
+      ip.role_k1500 IN (",list_rnd,") AS rnd,
+      ip.role_k1500 IN (",list_non_data_rnd,") AS non_data_rnd
       FROM target_rcids t
       JOIN revelio.individual_positions ip ON ip.rcid = t.rcid
-    LEFT JOIN revelio.individual_user iu ON iu.user_id = ip.user_id
-    WHERE ip.total_compensation IS NOT NULL AND ip.startdate IS NOT NULL", in_clause)) %>%
-        select(-rcid) %>% rename(rcid = parent_rcid) %>% 
-        .[, `:=`(college = highest_degree %in% c('Master', 'Bachelor', 'MBA', 'Doctor'),
-                 college_total = !is.na(highest_degree))] %>% 
-        .[!is.na(weight) & !is.na(total_compensation)] %>% 
-        .[, comp := total_compensation * weight] %>% 
-        merge(import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv'), by = 'role_k1500')
-      
+      LEFT JOIN revelio.individual_user iu ON iu.user_id = ip.user_id
+      WHERE ip.total_compensation IS NOT NULL AND ip.startdate IS NOT NULL AND ip.weight IS NOT NULL")) 
+          
       output_table = rbindlist(lapply(2000:2024, function(yr){
         sub_temp = lapply(c(0,1), function(lag){
           sub_temp = financial_dta[rcid == c_rcid & fiscal_year == yr] %>% 
@@ -416,8 +401,8 @@ if(importing_parent_role){
             .[startdate <= fiscal_yr_enddate & (enddate >= fiscal_yr_startdate | is.na(enddate))]  %>% 
             .[, .(comp_total = sum(comp), empl_total = sum(weight),
                   comp_data = sum(comp*data), empl_data = sum(weight*data),
+                  comp_non_std_data = sum(comp*non_std_data), empl_non_std_data = sum(weight*non_std_data),
                   comp_rnd = sum(comp*rnd), comp_stem = sum(comp*stem), comp_non_data_rnd = sum(comp*non_data_rnd),
-                  share_comp_data_analyst = sum(comp*data_analyst)/ sum(comp*data),
                   avg_prestige = NA_mean(prestige),
                   share_empl_college = NA_sum(weight*college)/ NA_sum(weight*college_total)), by = .(rcid, fiscal_year)] 
           if (lag == 1) sub_temp = sub_temp %>% rename_with(.cols = setdiff(names(sub_temp), c('rcid','fiscal_year')), ~paste0(.,'_lag1'))
@@ -431,7 +416,9 @@ if(importing_parent_role){
   }
   
   file_list = list.files(path = '1) data/11_parameter_calibration/raw/parent_temp', full.names = T)
-  parent_role_dta = rbindlist(lapply(file_list,import_file), use.names = T, fill = T)
+  parent_role_dta = rbindlist(lapply(file_list,import_file), use.names = T, fill = T) %>% 
+    mutate(across(gpaste('parent_comp_', c('data', 'stem', 'rnd')), ~./parent_comp_total, .names = "share_{col}")) %>% 
+    .[, parent_use_data := parent_comp_data > 0 ]
   
   ### add data on the extensive margin of first data hiring events 
   add_extensive_margin = function(dta, stub){
@@ -455,139 +442,188 @@ if(importing_parent_role){
 
     
     ## TRIM 
-    .[, (event_study_yr_5y_trim) := fifelse(event_study_yr > 5,  5, fifelse(event_study_yr < -5, -5, event_study_yr))] %>% 
-    .[, (event_study_yr_3y_trim) := fifelse(event_study_yr > 3,  3, fifelse(event_study_yr < -3, -3, event_study_yr))] %>% 
+    .[, (event_study_yr_5y_trim) := fifelse(event_study_yr > 5,  5, fifelse(event_study_yr < -6, -6, event_study_yr))] %>% 
+    .[, (event_study_yr_3y_trim) := fifelse(event_study_yr > 2,  2, fifelse(event_study_yr < -4, -4, event_study_yr))] %>% 
     .[, (in_event_study) := get(cohort) %in% us_year_range] %>% 
     .[, c('event_study_yr', 'event') := NULL]
   }
   parent_role_dta = add_extensive_margin(parent_role_dta, 'data') 
   
-  ### add data on the extensive margin of all data hiring events 
-  # parent_role_dta = parent_role_dta %>% 
-  #   .[, extensive_data_hire := parent_comp_data_lag1== 0 & parent_comp_data >0 & fiscal_year %in% us_year_range, by = rcid] %>% 
-  #   .[extensive_data_hire == T, `:=`(stacked_event_yr = 0, stacked_event_cohort = fiscal_year)] 
-  # 
-  # for (i in 1:50){
-  #   parent_role_dta = unbalanced_lag(parent_role_dta,'rcid', 'fiscal_year', c('stacked_event_yr', 'stacked_event_cohort'), c(-1,1)) %>% 
-  #     .[!is.na(stacked_event_yr_lead1) & parent_comp_data == 0, `:=`(stacked_event_yr = stacked_event_yr_lead1 - 1,
-  #                                                                    stacked_event_cohort = stacked_event_cohort_lead1) ] %>% 
-  #     .[!is.na(stacked_event_yr_lag1) & parent_comp_data > 0 ,  `:=`(stacked_event_yr = stacked_event_yr_lag1 + 1,
-  #                                                                    stacked_event_cohort = stacked_event_cohort_lag1)] %>% 
-  #     .[, gpaste('stacked_event_',c('yr_', 'cohort_'), c('lead', 'lag'),1) := NULL]
-  #   
-  #   if (nrow(parent_role_dta[stacked_event_yr %in% c(i, -i)]) == 0) break
-  # }
-  # parent_role_dta[, `:=`(stacked_event_yr_3yr =case_when(stacked_event_yr < -3 ~-3, stacked_event_yr >3 ~3, T~stacked_event_yr))] %>%
-  #               .[, `:=`(stacked_event_yr_5yr =case_when(stacked_event_yr < -5 ~-5, stacked_event_yr >5 ~5,T~stacked_event_yr))]
-
-  ## vars to prior 
-  # vars_to_prior = con_fil(parent_role_dta, 'comp', 'prestige', 'college') %>% con_fil(., 'lag', inc = F)
-  # parent_role_dta = unbalanced_lag(parent_role_dta, 'rcid', 'fiscal_year', vars_to_prior, 2:4)
-  # for (var in vars_to_prior){
-  #   parent_role_dta =  parent_role_dta[, paste0(var,"_prior5") := apply(.SD, 1,NA_mean), .SDcols = c(var, paste0(var, "_lag",1:4))] %>%
-  #     .[, paste0(var,"_prior3") := apply(.SD, 1,NA_mean), .SDcols = c(var, paste0(var, "_lag",1:2))] 
-  # }
-  # parent_role_dta[, con_fil(parent_role_dta, paste0('lag',2:4)):=NULL]
-  # 
-  
   
  write_parquet(parent_role_dta,'1) data/11_parameter_calibration/raw/6_parent_firm_role_dta.parquet') 
 }
 
-# import role data of subsidiaries  ---------------------------------------
-importing_subsidiary_role = F
-if(importing_subsidiary_role){
-  financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
-  rcid_matching =  wrds_query("SELECT rcid,child_rcid, ultimate_parent_rcid, year_founded, isin, cusip  FROM revelio.company_mapping WHERE isin is not NULL or cusip is not NULL") 
+
+# import executive role data of parent companies --------------------------------------
+doing_exec = F
+if (doing_exec){
+data_roles = import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv')  %>%.[data == T]%>% pull(role_k1500)
+financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
+
+rcid_list = unique(financial_dta[!is.na(ultimate_parent_rcid) & ultimate_parent_rcid == rcid][['rcid']])
+for (i in 1:length(rcid_list)){
+  output_file = paste0('1) data/11_parameter_calibration/raw/exec_temp/exec_role_',rcid_list[i],'.csv')
+  if (!file.exists(output_file)){
+    fwrite(data.frame(h = 'h'), output_file)
+    print(round(100* i/ length(rcid_list),2))
+    
+exec_experience =  wrds_query(paste0("
+WITH target_rcids AS (SELECT DISTINCT cm.rcid, cm.ultimate_parent_rcid
+    FROM revelio.company_mapping cm
+    WHERE cm.ultimate_parent_rcid = '", rcid_list[i],"'),
+senior_roles AS (
+    SELECT ip.user_id, ip.startdate, t.ultimate_parent_rcid
+    FROM target_rcids t
+    JOIN revelio.individual_positions ip ON ip.rcid = t.rcid
+    WHERE ip.startdate IS NOT NULL AND ip.seniority >= 6), 
+exec_cutoffs AS (SELECT sr.user_id, MAX(sr.startdate) AS last_senior5_startdate 
+    FROM senior_roles sr
+    GROUP BY sr.user_id)
+    
+SELECT ip.user_id, ip.startdate,ip.weight * ip.total_compensation as comp, ip.weight as emp,
+ip.enddate, ip.seniority, ip.rcid, cm.ultimate_parent_rcid, ip.role_k1500, ex.last_senior5_startdate
+FROM revelio.individual_positions ip
+JOIN exec_cutoffs ex on ip.user_id = ex.user_id
+LEFT JOIN revelio.company_mapping cm on ip.rcid = cm.rcid
+WHERE startdate IS NOT NULL  
+")) %>% .[,data_exec := role_k1500 %in% data_roles] %>% setorder(user_id, startdate) %>% 
+  .[,data_exp_exec := as.logical(cummax(as.integer(data_exec))), by = user_id] %>%
+  .[ultimate_parent_rcid == rcid_list[i] & seniority >= 6 & (data_exp_exec | data_exec)] %>% 
+  select(ultimate_parent_rcid, startdate, enddate, seniority,comp,emp, data_exp_exec, data_exec) %>% 
+  .[, enddate := fifelse(is.na(enddate), as.Date("2999-12-31"), enddate)]  %>% rename(rcid = ultimate_parent_rcid) %>% 
+  .[, `:=`(pos_start = startdate, pos_end = enddate)] %>% 
   
-  ### OBTAIN THE INFORMATION ON EACH FIRM'S SUBSIDIARIES 
-  remaining_subsids = Inf; i = 1
-  all_subsids =financial_dta %>% distinct(rcid, .keep_all =T) %>%
-    .[!is_ultimate_parent ==T] %>% 
-    select(rcid, child_rcid) %>% rename(child_rcid1 = child_rcid) %>%
-    .[child_rcid1 == rcid, child_rcid1 := NA]
-  while (remaining_subsids > 0){
-    ci1 = paste0('child_rcid', i+1); ci = paste0('child_rcid', i)
-    command = paste0("all_subsids = merge(all_subsids,rcid_matching %>% rename(",ci1 ,"=child_rcid,",ci, '= rcid) %>% ',
-                     ".[,c('", ci1, "', '", ci, "')], by = '",ci,"', all.x = T) %>% .[",ci1, "==", ci,", ", ci1, ":= NA]")
-    eval(parse(text = command))
-    remaining_subsids = nrow(all_subsids[!is.na(get(ci1))]) 
-    i = i +1
-  }
-  all_subsids = all_subsids %>% mutate(child_rcid0 = rcid) %>% 
-    pivot_longer( cols= -'rcid', values_to = 'child_rcid') %>%
-    filter(!is.na(child_rcid)) %>% select(rcid,child_rcid) %>% as.data.table()
+  # merge with financial data 
+  .[financial_dta[rcid == rcid_list[i], c('fiscal_year','fiscal_yr_startdate','fiscal_yr_enddate', 'rcid')] %>% distinct() %>% .[,og := 0] %>% 
+      bind_rows(mutate(., fiscal_year := fiscal_year - 1, across(con_fil(.,'yr'), ~. %m-% years(1)), og = 1)) %>% 
+      setorder(fiscal_year, og) %>%  .[, .SD[1], by = fiscal_year] %>% .[,og := NULL],
+    on = .(rcid,   enddate >= fiscal_yr_startdate, startdate <= fiscal_yr_enddate)] %>% 
   
-  rcid_list = sample(unique(all_subsids$rcid))
-  rcid_list = split(rcid_list, cut(seq_along(rcid_list), 500, labels =F))
- 
-  ### FOR EACH RCID OBTAIN THE INFO FROM ALL SUBSIDS 
-  for (i in (1:length(rcid_list))){
-    out_name = paste0('1) data/11_parameter_calibration/raw/subsid_temp/subsid_role_',i,'.csv')
-    if (!file.exists(out_name)){
-      fwrite(data.table(h = ''), out_name)
-      print(paste0(round(i/length(rcid_list)*100,2),'%'))
-      
-      rcid_segment = all_subsids[rcid %in%  rcid_list[[i]]][['child_rcid']]
-      in_clause <- paste(sprintf("'%s'", gsub("'", "''", rcid_segment)), collapse = ",")
-      temp = wrds_query(sprintf("
-  SELECT ip.rcid as child_rcid, ip.startdate, ip.enddate, ip.role_k1500, ip.total_compensation, ip.weight, 
-  iu.prestige, iu.highest_degree 
-  FROM revelio.individual_positions ip 
-  LEFT JOIN revelio.individual_user iu ON ip.user_id = iu.user_id
-  WHERE ip.total_compensation IS NOT NULL AND ip.startdate IS NOT NULL AND ip.rcid IN (%s)", in_clause)) %>% 
-        .[, `:=`(college = highest_degree %in% c('Master', 'Bachelor', 'MBA', 'Doctor'),
-                 college_total = !is.na(highest_degree))] %>% 
-        .[!is.na(weight) & !is.na(total_compensation)] %>% 
-        .[, comp := total_compensation * weight] %>% 
-        merge(import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv'), by = 'role_k1500') %>% 
-        merge(all_subsids[rcid %in%  rcid_list[[i]]], by = 'child_rcid', allow.cartesian = T) 
-      
-      output_table = rbindlist(lapply(2000:2024, function(yr){
-        sub_temp = lapply(c(0,1), function(lag){
-          sub_temp =financial_dta[rcid %in% rcid_segment & fiscal_year == yr] %>% 
-            distinct(rcid, fiscal_year, .keep_all = T) %>% 
-            .[,c('rcid', 'fiscal_year', 'fiscal_yr_startdate', 'fiscal_yr_enddate')] %>%
-            .[, `:=`(fiscal_yr_startdate= fiscal_yr_startdate %m-% years(lag), fiscal_yr_enddate= fiscal_yr_enddate %m-% years(lag))] %>% 
-            merge(temp, by = 'rcid') %>% 
-            .[startdate <= fiscal_yr_enddate & (enddate >= fiscal_yr_startdate | is.na(enddate))]  %>% 
-            .[, .(comp_total = sum(comp), empl_total = sum(weight),
-                  comp_data = sum(comp*data), empl_data = sum(weight*data),
-                  avg_prestige = NA_mean(prestige),
-                  share_empl_college = NA_sum(weight*college)/ NA_sum(weight*college_total)), by = .(rcid, fiscal_year)] 
-          
-          if (lag == 1) sub_temp = sub_temp %>% rename_with(.cols = setdiff(names(sub_temp), c('rcid','fiscal_year')), ~paste0(.,'_lag1'))
-          return(sub_temp)
-        })
-        sub_temp = merge(sub_temp[[1]], sub_temp[[2]], by = c('rcid', 'fiscal_year'), all = T)
-      })) %>% 
-        rename_with(.cols = con_fil(., 'rcid', 'fiscal_year', inc = F), ~paste0('parent_', .))
-      fwrite(output_table, out_name)
-    }
-  }
-  file_list = list.files(path = '1) data/11_parameter_calibration/raw/subsid_temp', full.names = T)
-  subsid_role_dta = rbindlist(lapply(file_list,import_file), use.names = T, fill = T)
-  write_parquet(subsid_role_dta,'1) data/11_parameter_calibration/raw/7_subsid_firm_role_dta.parquet') 
+  # clean up data / csuite desgination 
+  .[, `:=`(data_exp_exec = replace_na(data_exp_exec, F), 
+           data_exec = replace_na(data_exec, F), 
+           c_suite = case_when(is.na(seniority) | seniority != 7 ~F, T~T))] %>% 
+  .[, .(
+    # simple “has” flags
+    has_data_exp_exec    = any(data_exp_exec, na.rm = TRUE),
+    has_data_exec        = any(data_exec, na.rm = TRUE),
+    has_data_csuite      = any(data_exec & c_suite, na.rm = TRUE),
+    has_data_exp_csuite  = any(data_exp_exec & c_suite, na.rm = TRUE),
+    
+    # comp
+    comp_data_exp_exec   = sum(ifelse(data_exp_exec, comp, 0), na.rm = TRUE),
+    comp_data_exec       = sum(ifelse(data_exec, comp, 0), na.rm = TRUE),
+    comp_data_csuite     = sum(ifelse(data_exec & c_suite, comp, 0), na.rm = TRUE),
+    comp_data_exp_csuite = sum(ifelse(data_exp_exec & c_suite, comp, 0), na.rm = TRUE),
+    
+    # emp
+    emp_data_exp_exec    = sum(ifelse(data_exp_exec, emp, 0), na.rm = TRUE),
+    emp_data_exec        = sum(ifelse(data_exec, emp, 0), na.rm = TRUE),
+    emp_data_csuite      = sum(ifelse(data_exec & c_suite, emp, 0), na.rm = TRUE),
+    emp_data_exp_csuite  = sum(ifelse(data_exp_exec & c_suite, emp, 0), na.rm = TRUE)
+    ), by = .(rcid, fiscal_year)]
+fwrite(exec_experience, output_file)}
 }
+file_list = list.files(path = '1) data/11_parameter_calibration/raw/exec_temp', full.names = T)
+exec_dta = rbindlist(lapply(file_list,import_file), use.names = T, fill = T) 
+
+vars_to_extensive = con_fil(exec_dta, 'has')
+exec_dta = unbalanced_lag(exec_dta, 'rcid', 'fiscal_year', vars_to_extensive, 1)
+
+add_extensive_margin_exec = function(dta, stub){
+  has = paste0('has_',stub); 
+  lag_has = paste0(has, '_lag1');
+  cohort = paste0('extensive_hire_cohort_', stub) 
+  ever_use = paste0('ever_use_', stub)
+  event_study_yr_5y_trim = paste0('event_study_yr_5y_trim_',stub)
+  event_study_yr_3y_trim = paste0('event_study_yr_3y_trim_',stub)
+  in_event_study = paste0('in_event_study_', stub)
+  dta = setorder(dta,rcid,fiscal_year) %>% 
+    .[, event := get(lag_has) == 0 & get(has) >0] %>% 
+    .[, (cohort) := NA_min(fiscal_year[event]), by = rcid] %>% 
+    .[!is.na(get(cohort)), event_revert := get(has) == 0 & fiscal_year > get(cohort)] %>% 
+    .[, event_revert_yr := NA_min(fiscal_year[event_revert]), by = rcid] %>% 
+    mutate(across(con_fil(.,'cohort'), ~replace_na(as.numeric(.),Inf))) %>% 
+    .[, event_study_yr := fiscal_year - get(cohort)] %>% 
+    .[fiscal_year >= event_revert_yr,  event_study_yr := NA] %>% 
+    .[, paste0('event_study_yr_',stub) := event_study_yr] %>%
+    
+    
+    ## TRIM 
+    .[, (event_study_yr_5y_trim) := fifelse(event_study_yr > 5,  5, fifelse(event_study_yr < -5, -5, event_study_yr))] %>% 
+    .[, (event_study_yr_3y_trim) := fifelse(event_study_yr > 3,  3, fifelse(event_study_yr < -3, -3, event_study_yr))] %>% 
+    .[, (in_event_study) := get(cohort) >= min(us_year_range)] %>% 
+    .[, c('event_study_yr', 'event') := NULL]
+}
+for (stub in gsub('has_','', vars_to_extensive)){
+  exec_dta = add_extensive_margin_exec(exec_dta, stub) 
+}
+write_parquet(exec_dta,'1) data/11_parameter_calibration/raw/7_parent_exec_dta.parquet') 
+}
+
+# Generate trends in employment over time  --------------------------------
+generating_trends = F
+if(generating_trends){
+financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet")
+### Generate Inputs 
+rcid_list = setdiff(unique(financial_dta[is_ultimate_parent == T & usfirm == 1][['rcid']]), NA)
+in_clause = paste(sprintf("'%s'", gsub("'", "''", rcid_list)), collapse = ",")
+data_roles = import_file('1) data/7_revelio_data/b_processed_data/linkedin/revelio_role_dict.csv')  %>%.[data == T]%>% pull(role_k1500)
+data_roles =  paste(sprintf("'%s'", gsub("'", "''", data_roles)), collapse = ",")
+
+
+wrds <- dbConnect(RPostgres::Postgres(), host = "wrds-pgdata.wharton.upenn.edu",port = 9737,
+                  dbname = "wrds", user = "am0195", password = "BodyBody123!", sslmode = "require")
+wrds_query= function(query_string){dbGetQuery(wrds, query_string) %>% data.table()}
+
+data_role_spending_over_time = wrds_query(paste0(
+  "WITH target_rcids AS (
+      SELECT DISTINCT cm.rcid, cm.ultimate_parent_rcid
+      FROM revelio.company_mapping cm
+      WHERE cm.ultimate_parent_rcid IN (",in_clause , ")),
+   data_roles AS (
+      SELECT t.ultimate_parent_rcid  AS rcid,  ip.role_k1500, ip.startdate, ip.enddate,
+      ip.total_compensation*ip.weight AS comp, ip.weight AS count
+      FROM target_rcids t
+      JOIN revelio.individual_positions ip ON ip.rcid = t.rcid
+      WHERE ip.total_compensation IS NOT NULL AND ip.startdate IS NOT NULL 
+      AND ip.role_k1500 IN (",data_roles ,")
+      ),
+   years AS (
+      SELECT generate_series(DATE '2008-01-01', DATE '2024-01-01', INTERVAL '1 year') AS y0)
+      
+   SELECT EXTRACT(YEAR FROM y.y0)::int AS year, p.role_k1500, SUM(count) AS count,
+          SUM(p.comp) AS comp
+          FROM years y
+          JOIN data_roles p
+          ON p.startdate < (y.y0 + INTERVAL '1 year')       -- started before year end
+          AND (p.enddate  >= y.y0 OR p.enddate IS NULL)      -- ended on/after year start
+          GROUP BY 1, 2
+          ORDER BY 1, 2;
+      ")) %>%  .[,share_comp := comp / NA_sum(comp)]
+write_parquet(data_role_spending_over_time, '1) data/11_parameter_calibration/raw/data_role_spending_over_time.parquet') 
+}
+
+
 
 # generate combined dataset -------------------------------------------------------------------------
 combining_dta = T
 if(combining_dta){
-rcid_role_dta =  import_file('1) data/11_parameter_calibration/raw/10_firm_role_dta.parquet') 
+exec_dta = import_file('1) data/11_parameter_calibration/raw/7_parent_exec_dta.parquet')
+parent_role_dta = import_file('1) data/11_parameter_calibration/raw/6_parent_firm_role_dta.parquet') 
 financial_dta = import_file("1) data/11_parameter_calibration/clean/1_cleaned_financial_dta.parquet") 
-
 vars_to_log = c(gpaste(c('', 'parent_'),'comp_', c('data', 'total'), c('', '_lag1')),
                 gpaste('abs_',c('analyst', 'firm'), '_forecast_error'), 'forecast_horizon', 'age')
 
 combined_dta = merge(financial_dta, parent_role_dta, all.x = T, by = c('rcid', 'fiscal_year')) %>% 
- # merge(rcid_role_dta, all.x = T, by = c('rcid', 'fiscal_year')) %>%
+  merge(exec_dta, all.x = T, by = c('rcid', 'fiscal_year')) %>%
  
   ### generate an initial value of revenue 
   setorder(., fiscal_year) %>% 
   .[fiscal_year %in% us_year_range & !is.na(compustat_rev), compustat_rev_init := compustat_rev[1], by= .(gvkey)] %>%
   
   ## log necessary values 
-  mutate(across(con_fil(con_fil(.,  'comp', 'forecast','age'),'log', 'fraction', 'ratio', 'first', 'last', inc = F), ~asinh(.), .names = 'log_{col}')) %>% 
+  mutate(across(con_fil(con_fil(.,  'comp', 'forecast', 'realize_value'),'log', 'fraction', 'ratio', 'first', 'last', inc = F), ~asinh(.), .names = 'log_{col}')) %>% 
     
   ### restrict to sample rangs
   .[(measure == 'SAL' | is.na(measure)) & fiscal_year %in% us_year_range] 
@@ -602,31 +638,11 @@ combined_dta = merge(financial_dta, parent_role_dta, all.x = T, by = c('rcid', '
      .[, empl_inac_weight := 1/ (1 + emp_residual^2)] 
      median_weight = NA_median(model_dta$empl_inac_weight) 
    model_dta = model_dta[is.na(empl_inac_weight), empl_inac_weight := median_weight] %>% 
-     select('gvkey','ibes_ticker','fiscal_year', 'drop_parent', 'empl_inac_weight')
-   
-   # combined_dta = merge(combined_dta, model_dta, all.x = T) %>% 
-   #  .[drop_parent == T,con_fil(con_fil(., 'parent'), 'ultimate', 'drop', inc = F) := NA]  
-
-  
-   # ### drop top and bottom 1 percent outliers in terms of rcid employee count 
-   # model_dta = combined_dta[first_or_no_forecast == T]
-   # model = feols(data = model_dta, asinh(empl_total) ~ log_compustat_emp)
-   # non_dropped_obs = setdiff(1:nrow(model_dta),-1*model$obs_selection$obsRemoved)
-   # model_dta = model_dta[non_dropped_obs, emp_residual := model$residuals] 
-   # bottom_top = quantile(model_dta$emp_residual, c(.01, .99), na.rm = T)
-   # model_dta = model_dta[emp_residual < bottom_top[1] | emp_residual > bottom_top[2]][,drop_rcid_emp := T][,c('gvkey','ibes_ticker','comp_total','fiscal_year', 'drop_rcid_emp')]
-   # combined_dta = merge(combined_dta, model_dta, all.x = T, by = c('gvkey','ibes_ticker','comp_total','fiscal_year')) %>% 
-   #   .[drop_rcid_emp == T, con_fil(con_fil(combined_dta, 'comp_', 'emp_'), 'parent', inc = F) := NA]
-   
- 
-   ### Add last set of variables 
-   combined_dta = setorder(combined_dta,ibes_ticker, fiscal_year) %>% 
-     .[, log_fy_init_analyst_forecast := asinh(analyst_forecast_mean[1]), by = .(ibes_ticker, fiscal_year)] %>% 
-     .[fiscal_year >= revel_birth_year,revel_age := 1+ fiscal_year - as.numeric(revel_birth_year)] %>% 
-     .[,log_revel_age := log(revel_age)] %>% 
-     mutate(across(gpaste('parent_comp_', c('data', 'stem', 'rnd')), ~./parent_comp_total, .names = "share_{col}")) %>% 
-     .[, parent_use_data := parent_comp_data > 0 ]
-   
+     select('gvkey','ibes_ticker','fiscal_year', 'drop_parent', 'empl_inac_weight')  
+     
+     combined_dta = merge(combined_dta, model_dta, all.x = T) %>% 
+     .[, drop_parent := replace_na(drop_parent, F)]
+     
    ### generate windsorized_versions of key variables 
    vars_to_windsorize = con_fil(combined_dta,'log', 'share', 'avg')
    combined_dta[,(paste0("w_",vars_to_windsorize)) := lapply(.SD, function(x) windsorize(x, .01,.99)), by= fiscal_year, .SDcols =vars_to_windsorize]
