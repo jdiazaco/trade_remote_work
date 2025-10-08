@@ -3,14 +3,13 @@ packages = c('data.table', 'haven', 'readxl', 'openxlsx', 'stringr', 'readr', 'd
              'tidyverse', 'janitor', 'Matrix','parallel', 'bigmemory','bit64','tmvtnorm',
              'arrow', 'fixest', 'countrycode', 'survival', 'knitr', 'parallel', 'patchwork', 'scales', 'duckdb', 
              'truncnorm','sf', 'rnaturalearth', 'geosphere', 'giscoR', 'googledrive', 'R.matlab',
-             'DBI', 'RPostgres', 'quantmod', 'splines', 'ggwordcloud')
+             'DBI', 'RPostgres', 'quantmod', 'splines', 'ggwordcloud', 'jsonlite', 'future', 'future.apply')
 lapply(packages, function(package){tryCatch({library(package,character.only = T)}, error = function(cond){
   install.packages(package); library(package, character.only = T)
 })})
 source('2) code/00_helper_functions.R')
 
-
-
+safe_unload('MASS')
 # key path names  ---------------------------------------------------------
 raw_dir = 'C:/Users/Public/1. Microprod/0. Raw data processing/Data/'
 similiarity_dir = '1) data/0_misc_data/0c_similarity_matrices/'
@@ -86,5 +85,8 @@ de_dummy = function(string){ gsub("1a) dummy data/99_fake_output","3) output", s
 #PRESERVE INITIAL STATE OF AFFAIRS   --------------------------------------
 needed_for_import = c(gpaste(c('current_',''), c('import', 'export'), '_', c('name','dir')), 'code_to_run', 'i')
 base_env = c(ls(),'base_env', needed_for_import )
+
+
+
 
 

@@ -35,7 +35,7 @@ feols(data = data,  asinh(parent_empl_total) ~ log_compustat_emp | rcid + fiscal
 #1a Generate Word Cloud of the roles  --------------------------------------------------------------------
 making_graph = F
 if(making_graph){
-data = import_file('1) data/11_parameter_calibration/raw/data_role_spending_over_time.parquet') 
+data = import_file('1) data/11_parameter_calibration/data/clean/3_data_role_spending_over_time.parquet') 
 comp_2024 = sum(data[year == 2024][['comp']] )
 
 comp_wordcloud_2008 = ggplot(data[year == 2008], aes(label = role_k1500, size = comp/ comp_2024)) +

@@ -919,7 +919,7 @@ unbalanced_lag = function(data,id_var,time_var, value_vars, lag_amounts,
     data[, (extra) := NULL]
   }}
   
-  return(data %>% select(final_columns) %>% ungroup())
+  return(data %>% select(all_of(final_columns)) %>% ungroup())
   
 }
 
@@ -1111,11 +1111,82 @@ trend_metrics<-function(dt, vars_to_trend, vars_weight, time_var){
   return(dt)
   
 }
-
-windsorize = function(x, lb, ub){
-  lb_ub = quantile(x, na.rm = T, c(lb,ub))
-  x[x<lb_ub[1]] = lb_ub[1]
-  x[x>lb_ub[2]] = lb_ub[2]
-  return(x)
+# core clipper
+.wins <- function(v, lb, ub) {
+  qs <- stats::quantile(v, probs = c(lb, ub), na.rm = TRUE, names = FALSE)
+  v <- pmin(pmax(v, qs[1]), qs[2])
+  v
 }
 
+# winsorize x relative to y
+winsorize_relative <- function(x, y, lb = 0.01, ub = 0.99,
+                               method = c("ratio", "residual", "by_bins"),
+                               bins = 10) {
+  method <- match.arg(method)
+  stopifnot(length(x) == length(y))
+  n <- length(x)
+  
+  # keep NA mask to put NAs back where appropriate
+  na_mask <- is.na(x) | is.na(y)
+  
+  out <- rep(NA_real_, n)
+  
+  if (method == "ratio") {
+    r <- x / y
+    # avoid divide-by-zero/Infs
+    r[!is.finite(r)] <- NA_real_
+    r_w <- .wins(r, lb, ub)
+    out <- r_w * y
+    
+  } else if (method == "residual") {
+    # simple linear fit; swap to log/robust if you prefer
+    fit <- stats::lm(x ~ y)
+    res <- stats::residuals(fit)
+    res_w <- .wins(res, lb, ub)
+    out <- stats::fitted(fit) + res_w
+    
+  } else if (method == "by_bins") {
+    # quantile bins of y, then winsorize x within each bin
+    brks <- stats::quantile(y, probs = seq(0, 1, length.out = bins + 1),
+                            na.rm = TRUE, names = FALSE)
+    # ensure unique breakpoints (flat y edge cases)
+    brks <- unique(brks)
+    grp <- cut(y, breaks = brks, include.lowest = TRUE, labels = FALSE)
+    out <- x
+    for (g in sort(unique(grp[!is.na(grp)]))) {
+      idx <- which(grp == g)
+      out[idx] <- .wins(x[idx], lb, ub)
+    }
+  }
+  
+  # restore NAs where either x or y was NA
+  out[na_mask] <- NA_real_
+  out
+}
+
+
+safe_unload <- function(pkgs) {
+  for (pkg in pkgs) {
+    # 1) Detach from search path if attached
+    if (paste0("package:", pkg) %in% search()) {
+      try(detach(paste0("package:", pkg), unload = TRUE, character.only = TRUE), silent = TRUE)
+    }
+    # 2) If the namespace is still loaded, unload it
+    if (isNamespaceLoaded(pkg)) {
+      try(unloadNamespace(pkg), silent = TRUE)
+    }
+  }
+  invisible(NULL)
+}
+
+robust_scale <- function(v){
+  m <- median(v, na.rm=TRUE)
+  s <- mad(v, constant = 1, na.rm=TRUE)
+  if (!is.finite(s) || s == 0) s <- sd(v, na.rm=TRUE)
+  (v - m) / s
+}
+  
+
+  
+  
+  
