@@ -107,7 +107,14 @@ eta0 = list(alpha_1_raw = qlogis(.5),
 eta_names = names(eta0)
 
 
-
+bounds <- list(
+  alpha_1_raw = c(qlogis(.02), qlogis(.98)),
+  alpha_2_raw = c(qlogis(.02), qlogis(.98)),
+  Q_raw       = c(softplus_inv(1e-4), softplus_inv(5)),
+  theta_raw   = c(qlogis(1e-4), qlogis(1-1e-4)),
+  f0_raw      = c(qlogis(1e-4), qlogis(1-1e-4))
+)
+lower <- sapply(bounds, `[`, 1); upper <- sapply(bounds, `[`, 2)
 # perform likelihood estimation -------------------------------------------
 library('MASS'); library('numDeriv')
 calc_log_likelihood = function(eta, mode = c('calc', 'diagnostic')){
@@ -149,8 +156,6 @@ calc_log_likelihood = function(eta, mode = c('calc', 'diagnostic')){
     }
   }
   
-  
-  
   ## perform the likelihood 
   pi_mix <- 1   # amount of guassian in estimation. Stops us falling off cliffs 
   s2   <- Sigma_t[idx_FE]
@@ -189,109 +194,79 @@ calc_log_likelihood = function(eta, mode = c('calc', 'diagnostic')){
     return(list(output_df = output, output_params = params))
   }
 }  
-obj <- function(eta) calc_log_likelihood(eta, 'calc')
+k_initial_runs = function(K){
+  obj <- function(eta) calc_log_likelihood(eta, 'calc')
+  make_start <- function(eta0, jitter = 0.5, bounds = NULL) {
+    x <- as.numeric(eta0)
+    # logit raws: alpha_1_raw, alpha_2_raw, theta_raw, f0_raw
+    # softplus raws: mu_a_raw, phi_d_tilde_raw, sigma_a_raw, Q_raw
+    names(x) <- names(eta0)
+    
+    # default raw bounds (loose but finite)
+    if (is.null(bounds)) bounds <- list(
+      alpha_1_raw      = c( qlogis(.02),      qlogis(.98) ),
+      alpha_2_raw      = c( qlogis(.02),      qlogis(.98)),
+      Q_raw            = c( softplus_inv(1e-4), softplus_inv(5) ),
+      theta_raw        = c( qlogis(1e-4),      qlogis(1-1e-4) ),
+      f0_raw           = c( qlogis(1e-4),      qlogis(1-1e-4) )
+    )
+    
+    # jitter around eta0 within bounds
+    for (nm in names(x)) {
+      lo <- bounds[[nm]][1]; hi <- bounds[[nm]][2]
+      span <- (hi - lo)
+      prop_jit <- runif(1, -jitter, jitter)             # ±jitter fraction of span
+      cand <- x[[nm]] + prop_jit * span
+      x[[nm]] <- min(hi, max(lo, cand))
+    }
+    x
+  }
+  fit_from_start <- function(x0_raw) {
+    nloptr::nloptr(
+      x0 = x0_raw,
+      eval_f = function(x) list(objective = obj(x), gradient = numeric(length(x))),
+      eval_g_ineq = eval_g_ineq,
+      opts = list(algorithm="NLOPT_LN_COBYLA", maxeval=500, xtol_rel=1e-8)
+    )
+  }
+  starts <- replicate(K, make_start(eta0, jitter=0.8), simplify = FALSE)
+  fits <- lapply(1:K, function(i){print(i); fit_from_start(starts[[i]])})
+  tol <- 1e-6
+  feasible <- vapply(fits, function(fr) {
+    gi <- try(eval_g_ineq(fr$solution), silent=TRUE)
+    is.numeric(gi) && all(gi <= tol)
+  }, logical(1))
+  objvals <- vapply(fits, function(fr) fr$objective, numeric(1))
+  pick <- if (any(feasible)) which.min(replace(objvals, !feasible, Inf)) else which.min(objvals)
+  best_fit <- fits[[pick]]
+  eta_hat = best_fit$solution
+  return(eta_hat)
+}
 ll_total = function(eta_num){-calc_log_likelihood(eta_num, 'calc')}
 ll_vec = function(eta_num){calc_log_likelihood(eta_num, 'diagnostic')$output_df[!is.na(ll)]$ll}
-theta_from_eta = function(eta_num){as.numeric(calc_log_likelihood(eta_num, 'diagnostic')$output_params)}
-invert <- function(M) { co <- try(solve(M), silent = TRUE);if (inherits(co, "try-error")) MASS::ginv(M) else co}
 
-
-make_start <- function(eta0, jitter = 0.5, bounds = NULL) {
-  x <- as.numeric(eta0)
-  # logit raws: alpha_1_raw, alpha_2_raw, theta_raw, f0_raw
-  # softplus raws: mu_a_raw, phi_d_tilde_raw, sigma_a_raw, Q_raw
-  names(x) <- names(eta0)
-  
-  # default raw bounds (loose but finite)
-  if (is.null(bounds)) bounds <- list(
-    alpha_1_raw      = c( qlogis(.02),      qlogis(.98) ),
-    alpha_2_raw      = c( qlogis(.02),      qlogis(.98)),
-    Q_raw            = c( softplus_inv(1e-4), softplus_inv(5) ),
-    theta_raw        = c( qlogis(1e-4),      qlogis(1-1e-4) ),
-    f0_raw           = c( qlogis(1e-4),      qlogis(1-1e-4) )
-  )
-  
-  # jitter around eta0 within bounds
-  for (nm in names(x)) {
-    lo <- bounds[[nm]][1]; hi <- bounds[[nm]][2]
-    span <- (hi - lo)
-    prop_jit <- runif(1, -jitter, jitter)             # ±jitter fraction of span
-    cand <- x[[nm]] + prop_jit * span
-    x[[nm]] <- min(hi, max(lo, cand))
-  }
-  x
-}
-fit_from_start <- function(x0_raw) {
-  nloptr::nloptr(
-    x0 = x0_raw,
-    eval_f = function(x) list(objective = obj(x), gradient = numeric(length(x))),
-    eval_g_ineq = eval_g_ineq,
-    opts = list(algorithm="NLOPT_LN_COBYLA", maxeval=500, xtol_rel=1e-8)
-  )
-}
-
-
-K <- 10
-starts <- replicate(K, make_start(eta0, jitter=0.8), simplify = FALSE)
-fits <- lapply(1:K, function(i){print(i); fit_from_start(starts[[i]])})
-tol <- 1e-6
-feasible <- vapply(fits, function(fr) {
-  gi <- try(eval_g_ineq(fr$solution), silent=TRUE)
-  is.numeric(gi) && all(gi <= tol)
-}, logical(1))
-objvals <- vapply(fits, function(fr) fr$objective, numeric(1))
-pick <- if (any(feasible)) which.min(replace(objvals, !feasible, Inf)) else which.min(objvals)
-best_fit <- fits[[pick]]
-eta_hat = best_fit$solution
-Theta_hat =  calc_log_likelihood(eta_hat, 'diagnostic')$output_params
-
-run_variation = rbindlist(lapply(1:K, function(i){
- as.data.frame(calc_log_likelihood(fits[[i]]$solution, 'diagnostic')$output_params) %>% 
-   mutate(ll = -fits[[i]]$objective) %>% dplyr::select(ll, everything()) %>%
-    mutate(across(everything(), ~round(.,3)))
-})) %>% arrange(-ll)
-fwrite(run_variation, 'run_variation.csv')
-
-
-
-
+## run from ten different starting points
+eta_hat = suppressWarnings(k_initial_runs(10))
+n_obs  <- length(ll_vec(eta_hat))
 
 ### START POLISHING 
-n_obs  <- length(ll_vec(eta_hat))
-ll_mean <- function(z) calc_log_likelihood(z, 'calc') / n_obs
-
-bounds <- list(
-  alpha_1_raw = c(qlogis(.02), qlogis(.98)),
-  alpha_2_raw = c(qlogis(.02), qlogis(.98)),
-  Q_raw       = c(softplus_inv(1e-4), softplus_inv(5)),
-  theta_raw   = c(qlogis(1e-4), qlogis(1-1e-4)),
-  f0_raw      = c(qlogis(1e-4), qlogis(1-1e-4))
-)
-lower <- sapply(bounds, `[`, 1); upper <- sapply(bounds, `[`, 2)
-
-val <- function(z) ll_mean(z)
-
-## Helper: soft box penalty for Nelder-Mead
-penalized_val <- function(z, lambda = 10) {
+ll_over_n <- function(z) calc_log_likelihood(z, 'calc') / n_obs
+penalized_ll_over_n <- function(z, lambda = 10) {
   over <- pmax(z - upper, 0); under <- pmin(z - lower, 0)
-  val(z) + lambda * sum(over^2 + under^2)
-}
+  ll_over_n(z) + lambda * sum(over^2 + under^2)
+} ## Helper: soft box penalty for Nelder-Mead
 
-## 0) Report starting metrics
-v0 <- val(eta_hat)
-g0 <- tryCatch(numDeriv::grad(ll_mean, eta_hat, method="Richardson",
-                              method.args=list(eps=1e-5)), error=function(e) rep(NA_real_, length(eta_hat)))
-g0n <- if (all(is.finite(g0))) sqrt(sum(g0^2)) else NA_real_
-cat(sprintf("Start: f=%.6f, ||grad||=%s\n", v0, ifelse(is.na(g0n), "NA", format(g0n, digits=6))))
 
+v0 <- ll_over_n(eta_hat)
 eta_star <- eta_hat
 best_val <- v0
 moved <- FALSE
 
 ## 1) L-BFGS-B letting optim finite-diff the gradient
-opt1 <- optim(par = eta_star, fn = val, gr = NULL, method = "L-BFGS-B",
+opt1 <- optim(par = eta_star, fn = ll_over_n, gr = NULL, method = "L-BFGS-B",
               lower = lower, upper = upper,
               control = list(pgtol = 1e-6, maxit = 2000))
+
 cat(sprintf("[L-BFGS-B fd] conv=%d; f=%.6f; iters=%d; msg=%s\n",
             opt1$convergence, opt1$value, opt1$counts[['function']], opt1$message %||% ""))
 if (is.finite(opt1$value) && opt1$value < best_val - 1e-10) {
@@ -300,13 +275,13 @@ if (is.finite(opt1$value) && opt1$value < best_val - 1e-10) {
 
 ## 2) If no meaningful improvement, try Nelder–Mead on penalized objective
 if (!moved) {
-  opt2 <- optim(par = eta_star, fn = penalized_val, method = "Nelder-Mead",
+  opt2 <- optim(par = eta_star, fn = penalized_ll_over_n, method = "Nelder-Mead",
                 control = list(reltol = 1e-8, maxit = 5000))
   cat(sprintf("[Nelder-Mead] conv=%d; f_pen=%.6f; iters=%d; msg=%s\n",
               opt2$convergence, opt2$value, opt2$counts[['function']], opt2$message %||% ""))
   # project back into box just in case:
   cand <- pmin(pmax(opt2$par, lower), upper)
-  v2 <- val(cand)
+  v2 <- ll_over_n(cand)
   if (is.finite(v2) && v2 < best_val - 1e-10) {
     eta_star <- cand; best_val <- v2; moved <- TRUE
   }
@@ -321,7 +296,7 @@ if (!moved) {
     y <- pmax(pmin((z - L) / W, 1 - 1e-12), 1e-12)
     log(y) - log1p(-y)
   }
-  v_u <- function(u) val(to_z(u))
+  v_u <- function(u) ll_over_n(to_z(u))
   u0  <- from_z(eta_star)
   
   opt3 <- optim(par = u0, fn = v_u, method = "BFGS",
@@ -329,28 +304,24 @@ if (!moved) {
   cat(sprintf("[BFGS unconstrained] conv=%d; f=%.6f; iters=%d; msg=%s\n",
               opt3$convergence, opt3$value, opt3$counts[['function']], opt3$message %||% ""))
   cand <- to_z(opt3$par)
-  v3 <- val(cand)
+  v3 <- ll_over_n(cand)
   if (is.finite(v3) && v3 < best_val - 1e-10) {
     eta_star <- cand; best_val <- v3
   }
 }
 
-g_star <- tryCatch(numDeriv::grad(ll_mean, eta_star, method="Richardson",
-                                  method.args=list(eps=1e-5)),
-                   error=function(e) rep(NA_real_, length(eta_star)))
+g_star <- tryCatch(numDeriv::grad(ll_over_n, eta_star, method="Richardson", method.args=list(eps=1e-5)), error=function(e) rep(NA_real_, length(eta_star)))
 g_star_n <- if (all(is.finite(g_star))) sqrt(sum(g_star^2)) else NA_real_
-cat(sprintf("Final: f=%.6f, ||grad||=%s\n", best_val,
-            ifelse(is.na(g_star_n), "NA", format(g_star_n, digits=6))))
+cat(sprintf("Final: f=%.6f, ||grad||=%s\n", best_val, ifelse(is.na(g_star_n), "NA", format(g_star_n, digits=6))))
 
 
 
-
-
-## --- Conditioning + stationarity diagnostics ----------------------------
-ll_mean <- function(z) calc_log_likelihood(z,'calc') / length(ll_vec(z))
+## --- Compute Standard Errors  ----------------------------
+theta_from_eta = function(eta_num){as.numeric(calc_log_likelihood(eta_num, 'diagnostic')$output_params)}
+invert <- function(M) { co <- try(solve(M), silent = TRUE);if (inherits(co, "try-error")) MASS::ginv(M) else co}
 
 # mean-NLL gradient norm (are we at a stationary point?)
-g  <- numDeriv::grad(ll_mean, eta_star, method = "Richardson",
+g  <- numDeriv::grad(ll_over_n, eta_star, method = "Richardson",
                      method.args = list(eps = 1e-6))
 cat("||grad_mean|| =", sqrt(sum(g^2)), "\n")
 
@@ -403,15 +374,7 @@ se_table <- data.frame(
 ) %>% mutate(across(-param, ~round(.,5)))
 print(se_table)
 
-eta_act = eta0
-for (i in 1:length(eta0)){eta_act[[i]] = eta_star[[i]] }
-probe <- function(name, width=0.1, m=7){
-  base <- eta_act
-  xs <- seq(-width, width, length.out=m) + base[[name]]
-  ys <- sapply(xs, function(v){tmp <- base; tmp[[name]] <- v; calc_log_likelihood(tmp,'calc')/length(ll_vec(tmp))})
-  data.frame(x=xs, f=ys) %>% ggplot(., aes(x = x, y = f)) + geom_line() + labs(title = name)
-  ggsave(paste0(name, ".png"))
-}
-h =lapply(names(eta_act), probe)  # plot or inspect; flat/zigzag = kink or ridge
+
+
 
 
